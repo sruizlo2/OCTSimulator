@@ -1,0 +1,376 @@
+function [objPos, objBackscatJonesMat, objLayers, objLayerLabels,...
+  backScatProfile, backScatCoefProfile] =...
+  CreateIrregularLayeredBirefringentSampleRayleigh(inputParms)
+%
+% CreateIrregularLayeredBirefringentSampleRayleigh generates a layered 
+% (birefringent) sample given by a collection of point scatterers with
+% a scalar (vectorial) scattering potential and z,x,y location.
+%
+% [objPos, objBackscatJonesMat, objLayers, objLayerLabels,...
+%  speckleRegimeLabels, backScatProfile, backScatCoefProfile] =...
+%  CreateIrregularLayeredBirefringentSampleRayleigh(inputParms);
+%
+% Inputs:
+%   inputParms: Set of input parameters defying scan properties and sample
+%               properties
+%     objRangeXY: Range in lateral axes, in m.
+%     layerThickness: Thickness of each layer, in m.
+%     scatterersDensity: Scattering density of each constituent in each
+%                        layer, in m^-3.
+%     scaterrersRadius: Radius of each constituent in each layer, in m.
+%     scatterersIndex: Index of refraction of each constituent in each
+%                      layer.
+%     latSampling: Lateral sampling in [x,y], in m.
+%     axSampling: Axial sampling in z, in m.
+%     centralWavelength: Central wavelength, in m.
+%     wavenumberVect: Vector of wavenumber, in m^-1.
+%     varType: Variable type, to use CPU or GPU.
+%     absoptionCoef: Absorption coeffient, in m^-1.
+%     numAper: Numerical aperture.
+%     maxBatchSize: Maximum number of simultaneous point scatterers
+%                   (only changes memory requirement).
+%     structreImgSize: Size of the sample image in px [z, x, y]
+%                      (for visualization only).
+%     layerIrregularity: Irregularity of each layer, in m.
+%     doPS: Whether to compute sample's Jones matrix or not.
+%     layersBirefringence: Birefrigence per layer.
+%     layersFastAxisAngle: Fast scan angle axis per layer, in rad.
+%     layerForwardDepolarization: Depolarization in the forward
+%                                 direction per layer.
+%     layerBackwardDepolarization: Depolarization in the backward
+%                                  direction per layer.
+%     inputPolState: Input polarization state(s).
+%
+% Outputs:
+%   objPos: (z,x,y) location per point scatteres
+%   objBackscatJonesMat: Matrix scattering potential per point scatterer
+%   objLayers: Depth location of the boundaries between layers
+%   objLayerLabels: Labeling based on layer
+%                   (0 -> for background and 1 to nLayers for layers)
+%   backScatProfile: Discrete representation of the sample backscattering
+%                    (for visualization)
+%   backScatCoefProfile: Discrete representation of the sample 
+%                        backscattering coefficient (for visualization)
+%
+% Authors:  Sebastian Ruiz-Lopera {1*}, B. E. Bouma {1}
+%           and Nestor Uribe-Patarroyo {1}.
+%
+% SRL - BEB - NUP:
+%  1. Wellman Center for Photomedicine, Harvard Medical School, Massachusetts
+%     General Hospital, 40 Blossom Street, Boston, MA, USA.
+%
+%	* <srulo@mit.edu>
+%
+% Changelog:
+%
+% V1.0 (01-29-2024): Initial version released
+%
+% Copyright Sebastian Ruiz Lopera (2024)
+%
+
+MAKE_FIGS = 0;
+
+if nargin == 0
+  error('At the least one input is required');
+else
+  % If options are provided, unpack them
+  StructToVars(inputParms);
+end
+[nZ, nX, nY] = deal(structreImgSize(1), structreImgSize(2), structreImgSize(3));
+
+% Force specific layers to be flat
+if ~exist('flatLayers', 'var') || isempty(flatLayers)
+  flatLayers = [];
+end
+
+% Do not do compute PS signal if input state is not provided
+if ~exist('inputPolState', 'var') || isempty(inputPolState)
+  doPS = false;
+end
+% Do not need to permute absoptionCoef when having a single layer
+if numel(absoptionCoef) > 1; prmtIndxs = [1 3 2]; else prmtIndxs = [1 2 3]; end
+
+% Cumulative flat layer thicknesses
+flatLayerDepths = cumsum([0 layerThickness]);
+% Number of points per layer
+nPointSourcePerLayer = sum(round(layerThickness * objRangeXY(1) *...
+  objRangeXY(2) .* scatterersDensity), 1);
+% Number of points per constituent per layer
+nPointSourcePerConstituent = round(layerThickness * objRangeXY(1) *...
+      objRangeXY(2) .* scatterersDensity);
+% Number of layers
+nLayers = numel(nPointSourcePerLayer);
+% Number of constituents
+nConstituents = size(scatterersDensity, 1);
+% Scatterers batch size
+if ~exist('maxBatchSize', 'var') || isempty(maxBatchSize)
+  maxBatchSize = max(nPointSourcePerLayer(:)) * nConstituents;
+end
+% Initialize outputs
+objBackscatJonesMat = [];
+objPos = [];
+
+% Create irregular layers using 10-degree 2D polynomial
+[~,~, dVect] = ndgrid(1, 1, 1:10);
+% with random weights
+irregLayerWeights = 2 * (randn(nLayers + 1, 2, numel(dVect)) - 0.5) ./ dVect;
+irregLayerWeights(flatLayers, :, :) = 0;
+% Create 2D Polynomial
+irregularLayer = @(x, y, px, py) sum(permute(px, [2 1 3]) .* (x(:) .^ dVect) +...
+  permute(py, [2 1 3]) .* (y(:) .^ dVect), 3);
+% Create XY grid equal image size
+[yVect, xVect] = ndgrid(linspace(-1, 1, nY), linspace(-1, 1, nX));
+% Compute irregular layers for image pixel coordinate
+objLayers = permute(irregularLayer(xVect(:),...
+  yVect(:) / objRangeXY(1) * objRangeXY(2), irregLayerWeights(:, 1, :),...
+  irregLayerWeights(:, 2, :)), [3 2 1]);
+% figure(6), plot(squeeze(objLayers)')
+% Compute limits of each layer for normalize
+layerMinLims = min(objLayers, [], [1 3]);
+layerMaxLims = max(objLayers - layerMinLims, [], [1 3]);
+layerMaxLims(sum(objLayers, 3) == 0) = 1;
+% Now layers are normalized to [-1, 1]
+normF = @(f, minF, maxF) 2 * (((f - minF) ./ maxF) - 0.5);
+irregularLayer = @(x, y, px, py, r, minF, maxF) permute(r(:), [2 1 3]) .*...
+  normF(sum(permute(px, [2 1 3]) .* (x(:) .^ dVect) +...
+  permute(py, [2 1 3]) .* (y(:) .^ dVect), 3), minF, maxF);
+thisNPointSourcePerConstituent = 0;
+% iterate over batches
+addPointsScatterers = true;
+thisBatch = 0;
+while addPointsScatterers
+  % Initialize output
+  objPosZ = [];
+  objPosX = [];
+  objPosY = [];
+  cumLayerThickness = [];
+  layerIrregThickness = [];
+  layerIndxs = [];
+  layerMask = [];
+  constituentIndxs = [];
+  thisBatch = thisBatch + 1;
+  % Number of points in current batch
+  %   thisNPointSourcePerLayer = max(min(maxBatchSize,...
+  %     nPointSourcePerLayer - sum(thisNPointSourcePerConstituent)), 0);
+  % Iterate over layers
+  for thisLayer = 1:nLayers
+    thisNPointSourcePerConstituent = max(min(floor(maxBatchSize / nConstituents),...
+      nPointSourcePerConstituent(:, thisLayer) - floor(maxBatchSize  / nConstituents) * (thisBatch - 1)), 0);
+    thisNPointSourcePerLayer = sum(thisNPointSourcePerConstituent);
+    % Create points with random 3D positions within the current layer
+    % X locations
+    thisObjPosX = 2 * (rand(1, 1, thisNPointSourcePerLayer, varType{:}) - 0.5);
+    objPosX = cat(3, objPosX, objRangeXY(1)  / 2 * thisObjPosX);
+    % Y locations
+    thisObjPosY = 2 * (rand(1, 1, thisNPointSourcePerLayer, varType{:}) - 0.5);
+    objPosY = cat(3, objPosY, objRangeXY(2)  / 2 * thisObjPosY);
+    % Compute irregular layer map for current set of points
+    theseLayers = flatLayerDepths + permute(irregularLayer(thisObjPosX,...
+      thisObjPosY / objRangeXY(1) * objRangeXY(2), irregLayerWeights(:, 1, :),...
+      irregLayerWeights(:, 2, :), layerIrregularity, layerMinLims, layerMaxLims), [3 2 1]);
+    % Make all depths positive (first layer may have negative values due to irregularity)
+    if thisLayer == 1 && thisBatch == 1
+      layersOffset = min(theseLayers(1, 1, :), [], 'all');
+    end
+    theseLayers = theseLayers - layersOffset;
+    % Calculate thickness of each layer for each point
+    theseLayersThickness = diff(theseLayers, 1, 2);
+    layerIrregThickness = cat(3, layerIrregThickness, theseLayersThickness);
+    % Calculate cummulative thickness for each point, up to the previous
+    % layer to which the point belongs
+    cumLayerThickness = cat(3, cumLayerThickness, theseLayers(1, thisLayer, :));
+    % Z locations
+    thisObjPosZ = theseLayers(1, thisLayer + 1, :) - (theseLayersThickness(1, thisLayer, :) .*...
+      rand(1, 1, thisNPointSourcePerLayer, varType{:}));
+    objPosZ = cat(3, objPosZ, thisObjPosZ);
+    % Layer index of each point
+    layerIndxs = cat(3, layerIndxs, thisLayer * ones(1, 1, thisNPointSourcePerLayer));
+    % Constituent index of each point
+    for thisConst = 1:nConstituents
+      constituentIndxs = cat(3, constituentIndxs, thisConst * ones(1, 1, thisNPointSourcePerConstituent(thisConst)));
+    end
+    % Mask with ones in the current and all preceeding indexes
+    layerMask = cat(3, layerMask, cat(2, ones(1, thisLayer - 1, thisNPointSourcePerLayer),...
+      zeros(1, nLayers - thisLayer + 1, thisNPointSourcePerLayer)));
+    % Plot points and layers
+    if MAKE_FIGS
+      figure2(1001),subplot(121),scatter3(objRangeXY(1)  / 2 * thisObjPosX(:) * 1e3,...
+        objRangeXY(2) / 2 * thisObjPosY(:) * 1e3,...
+        thisObjPosZ(:) * 1e3, '.'), hold on
+      scatter3(objRangeXY(1)  / 2 * thisObjPosX(:) * 1e3,...
+        objRangeXY(2)  / 2 * thisObjPosY(:) * 1e3,...
+        squeeze(theseLayers(1, thisLayer + 1, :)) * 1e3, 'k.'); hold on
+      if thisLayer == 1
+        scatter3(objRangeXY(1)  / 2 * thisObjPosX(:) * 1e3,...
+          objRangeXY(2)  / 2 * thisObjPosY(:) * 1e3,...
+          squeeze(theseLayers(1, 1, :)) * 1e3, 'k.'); hold on
+      end
+    end
+  end
+
+  % Now compute backscattered light
+  % Relative index of refraction, make it zero iff scatterersIndex == 0
+  relIndex = max(mediaIndex ./ scatterersIndex .* (scatterersIndex ~= 0), 0);
+  % Scattering cross-section for each constituent
+  scattCrossSec  = 8 * pi / 3 .* ((relIndex .^ 2 - 1) ./...
+    (relIndex .^ 2 + 2)) .^ 2 .* (2 * pi * mediaIndex /...
+    centralWavelength) .^ 4 .* scaterrersRadius .^ 6;
+  localLayerMask = layerIndxs == (1:nLayers);
+  localConstMask = permute(constituentIndxs == (1:nConstituents), [2 1 3]);
+  % Backscattering coefficient of each layer
+  backscatteringCoef = sum(permute(sum(scattCrossSec .*...
+    scatterersDensity .* localConstMask, 1).* localLayerMask, [1 2 3]), 2);
+  % Cummulative optical depth (optical depth of all preceding layers)
+  opticalDepthGlobal = sum((absoptionCoef +...
+    sum(scattCrossSec .* scatterersDensity .* localConstMask, 1)) .*...
+    layerIrregThickness .* layerMask, 2);
+  % Local optical depth (optical depth within the current layer only)
+  opticalDepthLocal = sum((permute(absoptionCoef(layerIndxs), prmtIndxs) +...
+    backscatteringCoef) .* (objPosZ - cumLayerThickness) .* localLayerMask, 2);
+  % Optical depth: the optical depth is the sum of the optical depth of all
+  % preceding layers and the optical depth of the current layer up to the
+  % current depth
+  opticalDepth = opticalDepthGlobal + opticalDepthLocal;
+  % Make plots to debug
+  if MAKE_FIGS
+    figure2(200), subplot(221), plot(objPosZ(:), backscatteringCoef(:),'.'),
+    subplot(222), plot(objPosZ(:), opticalDepthGlobal(:),'.'),
+    subplot(223), plot(objPosZ(:), opticalDepthLocal(:),'.'),
+    subplot(224), plot(objPosZ(:), opticalDepth(:),'.'),
+  end
+  % Backscattering fraction
+  beta = sqrt(1 - numAper^2);
+  backscatteringFraction = 1 / (16 * pi) .* (beta .^ 3  + 3 .* beta + 4);
+  % Fraction of backscattered intensity
+  objBackscat =  backscatteringFraction * backscatteringCoef .* exp(-2 * opticalDepth);
+  % Flip sample and shift as desired
+
+  if doPS
+    % Now compute Jones matrix for each scatterer, considering the
+    % cummulative Jones matrix from preceeding layers and from curent layer
+    % Phase retardation of the entire layers
+    angleLocal = permute(permute(layersFastAxisAngle(layerIndxs), prmtIndxs), [1 4 3 2]);
+    phaseRetGlobal = permute(centralWavenumber .* layerIrregThickness .*...
+      layerMask .* layersBirefringence, [5 4 3 2 1]);
+    angleGlobal = permute(layersFastAxisAngle .* layerMask, [1 4 3 2]);
+    % Phase retardation within the local layers
+    phaseRetLocal = permute(centralWavenumber .* (objPosZ - cumLayerThickness) .*...
+      permute(layersBirefringence(layerIndxs), prmtIndxs), [5 4 3 2 1]);
+    % Jones matrix of each layer (birefringence only)
+    layersBirefJonesMatsAll = MakeJonesMatrix(cat(4, phaseRetGlobal, phaseRetLocal),...
+      repmat(cat(4, angleGlobal, angleLocal), [1 1 1 1 length(centralWavenumber)]));
+    % Standard deviation of phase retardation for depolarization
+    phaseRetStdGlobal = permute(min(pi, sqrt(-0.5 * log(1 - (layerMask .* layerForwardDepolarization)))), [1 4 3 2]);
+    phaseRetStdLocal = permute(min(pi, sqrt(-0.5 * log(1 - layerBackwardDepolarization(layerIndxs)))), prmtIndxs);
+    % Optic axis of the phase retardation for depolarization
+    delta = angle(inputPolState(2, :) .* conj(inputPolState(1, :)));
+    angleDep = pi / 4 - (0.5 * atan2(2 * prod(abs(inputPolState), 1) .* cos(delta),...
+      (inputPolState(2, :) .^ 2 - inputPolState(1, :) .^ 2)));
+    % Jones matrix of each layer (depolarization only)
+    layersDepJonesMatsAll = permute(MakeJonesMatrix(cat(4, phaseRetStdGlobal, phaseRetStdLocal) .*...
+      randn(1, 1, size(phaseRetStdGlobal, 3)), permute(angleDep, [1 5 3 4 2])), [1 2 3 4 6 5]);
+    % Multiply Jones matrices layer by layer
+    scatJonesMats = eye(2);
+    for thisLayer = nLayers+1:-1:1
+      scatJonesMats = pagemtimes(scatJonesMats,...
+        layersDepJonesMatsAll(:, :, :, thisLayer, :, :));
+      scatJonesMats = pagemtimes(scatJonesMats,...
+        layersBirefJonesMatsAll(:, :, :, thisLayer, :, :));
+    end
+    clear phaseRet* angle* layersBirefJonesMatsAll layersDepJonesMatsAll
+    % and multiply by transpose to get double-pass Jones matrix
+    % J_S = J^T_1:n * J_n:1 = (J_n:1)^T * J_n:1
+    scatJonesMats = permute(pagemtimes(pagetranspose(scatJonesMats), scatJonesMats), [1 2 3 5 6 4]);
+    %   scatJonesMats = permute(scatJonesMats, [1 2 3 5 6 4]);
+    % Scatterers Jones matrix
+    objBackscatJonesMat = cat(1, objBackscatJonesMat, objBackscat(:) .* permute(scatJonesMats, [3 1 2 4 5]));
+  else
+    objBackscatJonesMat = cat(1, objBackscatJonesMat, objBackscat(:));
+  end
+
+  % Scatterers location
+  objPos = cat(3, objPos, cat(1, objPosZ, objPosX, objPosY));
+
+  % Are we finished adding point scatterers?
+  addPointsScatterers = length(objBackscatJonesMat) < sum(nPointSourcePerLayer);
+end
+objPos = permute(objPos, [3 1 2]);
+
+% Calculate object structure image if requested
+if nargout > 2
+  % Create XY grid equal image size
+  [yVect, xVect, zVect] = ndgrid(linspace(-1, 1, nY), linspace(-1, 1, nX), linspace(1, nZ, 2*nZ));
+  % Compute irregular layers for image pixel coordinate
+  objLayers = flatLayerDepths + permute(irregularLayer(xVect(:),...
+    yVect(:) / objRangeXY(1) * objRangeXY(2), irregLayerWeights(:, 1, :),...
+    irregLayerWeights(:, 2, :), layerIrregularity,...
+    layerMinLims, layerMaxLims), [3 2 1]) - layersOffset;
+  % Thickness of each layer
+  layerIrregThickness = diff(objLayers, 1, 2);
+  % Cummulative thickness
+  cumLayerThickness = objLayers;
+  % Relative index of refraction, make it zero iff scatterersIndex == 0
+  relIndex = max(mediaIndex(1) ./ scatterersIndex .* (scatterersIndex ~= 0), 0);
+  % Scattering cross-section for each constituent
+  scattCrossSec  = 8 * pi / 3 .* ((relIndex .^ 2 - 1) ./...
+    (relIndex .^ 2 + 2)) .^ 2 .* (2 * pi * mediaIndex(1) /...
+    centralWavelength) .^ 4 .* scaterrersRadius .^ 6;
+  % Label each depth with its corresponding layer index and create mask to
+  % exclude depths without scatterers
+  objPosZ = permute(zVect(:) * axSampling, [3 2 1]);
+  localLayerMask = diff(objPosZ <= objLayers, 1, 2);
+  mask = sum(localLayerMask, 2) > 0;
+  [~, layerIndxs] = max(localLayerMask, [], 2);
+  layerMask = (objPosZ >= objLayers(1, 2:end, :)) .* mask;
+  % Backscattering coefficient of each layer
+  backscatteringCoef = permute(sum(scattCrossSec(:, layerIndxs) .*...
+    scatterersDensity(:, layerIndxs), 1), [1 3 2]) .* mask;
+  % Cummulative optical depth (optical depth of all preceding layers)
+  opticalDepthGlobal = sum((absoptionCoef +...
+    sum(scattCrossSec .* scatterersDensity, 1)) .*...
+    layerIrregThickness .* layerMask, 2);
+  % Local opt ical depth (optical depth within the current layer only)
+  %   objPosZ(:, :, mask) = objPosZ;
+  opticalDepthLocal = sum((permute(absoptionCoef(layerIndxs), prmtIndxs) +...
+    backscatteringCoef) .* (objPosZ -...
+    cumLayerThickness(1, 1:end-1, :)) .* localLayerMask, 2);
+  % Optical depth: the optical depth is the sum of the optical depth of all
+  % preceding layers and the optical depth of the current layer up to the
+  % current depth
+  opticalDepth = (opticalDepthGlobal + opticalDepthLocal);
+  % Make plots to debug
+  if MAKE_FIGS
+    figure2(201), subplot(221), plot(objPosZ(:), backscatteringCoef(:),'.'),
+    subplot(222), plot(objPosZ(:), opticalDepthGlobal(:),'.'),
+    subplot(223), plot(objPosZ(:), opticalDepthLocal(:),'.'),
+    subplot(224), plot(objPosZ(:), opticalDepth(:),'.'),
+  end
+  % Image with backscattering profile
+  backScatProfile = permute(reshape(backscatteringFraction * backscatteringCoef .*...
+    exp(-2 * opticalDepth) .* mask, [nY, nX, 2*nZ]), [3 2 1]);
+  % Image with backscattering coefficient profile
+  backScatCoefProfile = permute(reshape(backscatteringCoef, [nY, nX, 2*nZ]), [3 2 1]);
+  %   figure(14), imagesc(backScatCoefPorfile(:, :, 3)), axis image
+  % Shift sample surface as desired
+  % Create and reshape output with layers
+  [yVect, xVect] = ndgrid(linspace(-1, 1, nY), linspace(-1, 1, nX));
+  objLayers = flatLayerDepths + permute(irregularLayer(xVect(:),...
+    yVect(:) / objRangeXY(1) * objRangeXY(2), irregLayerWeights(:, 1, :),...
+    irregLayerWeights(:, 2, :), layerIrregularity,...
+    layerMinLims, layerMaxLims), [3 2 1]) - layersOffset;
+  objLayers = permute(reshape(objLayers, [1, nLayers + 1, nY, nX]), [1 4 3 2]);
+
+  % Output pixel labels (1-nLayers + 0 for noise)
+  objLayerLabels = cat(2, localLayerMask, ~mask);
+  objLayerLabels = permute(reshape(objLayerLabels, [], nX, nY, 2*nZ), ...
+    [4, 2, 3, 1]);
+end
+end
+
+function JonesMatrix = MakeJonesMatrix(phaseRet, angle)
+dimcolons = repmat({':'}, [max(ndims(phaseRet), ndims(angle)) - 2 1]);
+JonesMatrix(1, 1, dimcolons{:}) = cos(angle) .^ 2 + (exp(-1i * phaseRet) .* sin(angle) .^ 2);
+JonesMatrix(1, 2, dimcolons{:}) = (1 - exp(-1i * phaseRet)) .* cos(angle) .* sin(angle);
+JonesMatrix(2, 1, dimcolons{:}) = (1 - exp(-1i * phaseRet)) .* cos(angle) .* sin(angle);
+JonesMatrix(2, 2, dimcolons{:}) = sin(angle) .^ 2 + (exp(-1i * phaseRet) .* cos(angle) .^ 2);
+end
